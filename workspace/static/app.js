@@ -6,7 +6,7 @@ const $$ = (s, r = document) => [...r.querySelectorAll(s)];
 
 const state = {
   status: null, candidates: [], releases: [], events: [],
-  patches: [], snapshots: [], view: null,
+  patches: [], snapshots: [], view: null, rollouts: [],
   viewMode: "published", viewRef: null,
   selectedCandidate: null, selectedSnapshot: null,
   fullSnapshot: null,
@@ -50,7 +50,7 @@ const esc = s => String(s ?? "").replace(/[&<>"]/g, c =>
 async function refreshAll() {
   await Promise.all([
     loadStatus(), loadCandidates(), loadReleases(),
-    loadEvents(), loadPatches(), loadSnapshots(),
+    loadEvents(), loadPatches(), loadSnapshots(), loadRollouts(),
   ]);
   await refreshView();
 }
@@ -122,7 +122,8 @@ async function refreshView() {
 function badge(status) {
   const map = { draft: "b-draft", submitted: "b-submitted", published: "b-published",
     rejected: "b-rejected", active: "b-active", proposed: "b-proposed",
-    revoked: "b-revoked", completed: "b-completed", superseded: "b-superseded" };
+    revoked: "b-revoked", completed: "b-completed", superseded: "b-superseded",
+    promoted: "b-published", rolled_back: "b-revoked" };
   return `<span class="badge ${map[status] || "b-draft"}">${esc(status)}</span>`;
 }
 function renderCandidates() {
@@ -342,6 +343,119 @@ function renderPatches() {
   }));
 }
 
+// ------------------------------------------------------------- rollouts ----
+async function loadRollouts() {
+  ({ rollouts: state.rollouts } = await api("/rollouts"));
+  renderRollouts();
+  populateRolloutCandidates();
+}
+
+function populateRolloutCandidates() {
+  const sel = $("#rolloutCandidate");
+  const cur = sel.value;
+  const ok = state.candidates.filter(c =>
+    c.validation?.status === "passed" && c.status !== "published");
+  sel.innerHTML = ok.map(c =>
+    `<option value="${esc(c.candidate_id)}">${esc(c.candidate_id)}（${
+      c.regions.map(esc).join(",")}）</option>`).join("")
+    || `<option value="">（无校验通过的候选）</option>`;
+  if (cur && ok.some(c => c.candidate_id === cur)) sel.value = cur;
+  const c = ok.find(x => x.candidate_id === sel.value);
+  if (c && !$("#rolloutRegions").value) $("#rolloutRegions").value = c.regions.join(",");
+}
+
+function renderRollouts() {
+  const el = $("#rolloutList");
+  el.innerHTML = state.rollouts.map(b => {
+    const w = b.window || {};
+    const statRow = (g, label) => {
+      const st = b.stats[g];
+      return `<tr><td>${label}</td><td class="gen">${st.requests}</td>
+        <td class="${st.unreachable ? "err-code" : "gen"}">${st.unreachable}</td>
+        <td class="${st.transition_rejected ? "err-code" : "gen"}">${st.transition_rejected}</td></tr>`;
+    };
+    const decision = b.decision ? `<div class="meta">判定：<b>${esc(b.decision.action)}</b>
+      ${b.decision.release_id ? "→ " + esc(b.decision.release_id) : ""}
+      ${b.decision.reason ? "· " + esc(b.decision.reason) : ""}
+      · ${esc((b.decision.at || "").replace("T", " ").replace("+00:00", "Z"))}</div>` : "";
+    const breaches = (b.breaches || []).map(x =>
+      `<div class="err-item" style="margin-top:6px"><span class="err-code">[THRESHOLD]</span> ${esc(x)}</div>`
+    ).join("");
+    return `<div class="card" data-rid="${esc(b.rollout_id)}">
+      <div class="row1"><span class="id">${esc(b.rollout_id)}</span>
+        ${badge(b.status)}
+        ${b.status === "active" && !b.window_open ? `<span class="badge b-proposed">观察窗口已结束</span>` : ""}
+      </div>
+      <div class="note">候选 ${esc(b.candidate_id)} · 区域 ${b.regions.map(esc).join(",")}
+        · 名单 ${b.vehicles.map(esc).join(", ") || "—"}</div>
+      <div class="meta">窗口 ${esc((w.start || "").replace("T", " ").slice(5, 16))} →
+        ${w.end ? esc(w.end.replace("T", " ").slice(5, 16)) : "不限"}
+        ${b.trial_version_preview ? ` · 待晋级版本 <span class="gen">${esc(b.trial_version_preview)}</span>` : ""}</div>
+      <table class="data" style="margin-top:6px">
+        <tr><th>分组</th><th>请求量</th><th>不可达</th><th>安全过渡拒绝</th></tr>
+        ${statRow("trial", "🧪 试运行组（待晋级内容）")}
+        ${statRow("control", "对照组（当前内容）")}
+      </table>
+      ${breaches}${decision}
+      <div class="actions">
+        ${b.status === "active" ? `
+          <button class="ok" data-act="promote" ${b.promotable ? "" : "disabled"}
+            title="${b.promotable ? "按当前统计一次性晋级（原子发布全部作用区域）" : "阈值越界，禁止晋级"}">⬆ 一次性晋级</button>
+          <button class="danger" data-act="rollback">⤺ 撤回批次</button>` : ""}
+      </div></div>`;
+  }).join("") || `<div class="hint">暂无试运行批次</div>`;
+
+  $$("#rolloutList button").forEach(btn => btn.addEventListener("click", async () => {
+    const rid = btn.closest(".card").dataset.rid;
+    try {
+      if (btn.dataset.act === "promote") {
+        const r = await api(`/rollouts/${rid}/promote`, { method: "POST", body: {} });
+        toast(`✓ ${rid} 已晋级为 ${r.decision.release_id}` +
+          (r.idempotent ? "（重复操作，返回首次结果）" : ""), "ok");
+      } else {
+        const r = await api(`/rollouts/${rid}/rollback`,
+          { method: "POST", body: { reason: "运维撤回" } });
+        toast(`✓ ${rid} 已撤回；已发出快照与区域代际保持不变` +
+          (r.idempotent ? "（重复操作，返回首次结果）" : ""), "ok");
+      }
+      await refreshAll();
+    } catch (e) { await refreshAll(); showError(e); }
+  }));
+}
+
+$("#createRolloutBtn").addEventListener("click", async () => {
+  const cid = $("#rolloutCandidate").value;
+  if (!cid) return toast("没有可试运行的候选（请先在地图审查页校验通过）", "error");
+  const body = {
+    candidate_id: cid,
+    regions: $("#rolloutRegions").value.split(",").map(x => x.trim()).filter(Boolean),
+    vehicles: $("#rolloutVehicles").value.split(",").map(x => x.trim()).filter(Boolean),
+  };
+  const mins = Number($("#rolloutWindow").value);
+  if (mins > 0) body.window = { end: new Date(Date.now() + mins * 60000).toISOString() };
+  const th = {};
+  if ($("#rolloutMaxUnreach").value !== "") th.max_unreachable = Number($("#rolloutMaxUnreach").value);
+  if ($("#rolloutMaxReject").value !== "") th.max_transition_rejected = Number($("#rolloutMaxReject").value);
+  if (Object.keys(th).length) body.thresholds = th;
+  try {
+    const b = await api("/rollouts", { method: "POST", body });
+    $("#rolloutCreateResult").innerHTML = `<div class="ok-item">✓ 批次 <b>${esc(b.rollout_id)}</b>
+      已创建：名单内车辆的新行程将使用待晋级内容（${esc(b.trial_version_preview || "")}），
+      名单外继续读取当前内容。</div>`;
+    toast(`✓ 试运行批次 ${b.rollout_id} 已创建`, "ok");
+    await refreshAll();
+  } catch (e) {
+    $("#rolloutCreateResult").innerHTML = `<div class="err-item"><span class="err-code">[${
+      esc(e.code || "ERROR")}]</span> ${esc(e.message)}</div>`;
+    showError(e);
+  }
+});
+
+$("#rolloutCandidate").addEventListener("change", () => {
+  const c = state.candidates.find(x => x.candidate_id === $("#rolloutCandidate").value);
+  if (c) $("#rolloutRegions").value = c.regions.join(",");
+});
+
 // -------------------------------------------------------------- routes -----
 function populateVehicles() {
   const sel = $("#vehicleSelect");
@@ -365,7 +479,8 @@ function renderSnapshots() {
   el.innerHTML = state.snapshots.map(s => {
     const sel = state.selectedSnapshot === s.snapshot_id ? "selected" : "";
     return `<div class="card ${sel}" data-sid="${esc(s.snapshot_id)}">
-      <div class="row1"><span class="id">${esc(s.snapshot_id)}</span>${badge(s.status)}</div>
+      <div class="row1"><span class="id">${esc(s.snapshot_id)}</span>${badge(s.status)}
+        ${(s.rollouts || []).map(r => `<span class="badge ${r.group === "trial" ? "b-active" : "b-superseded"}">🧪${esc(r.rollout_id)}·${r.group === "trial" ? "试运行" : "对照"}</span>`).join("")}</div>
       <div class="note">${esc(s.vehicle_id)} · ${esc(s.from_node)} → ${esc(s.to_node)}</div>
       <div class="meta">${esc(s.version)}</div>
       <div class="meta">${s.steps} 步 · ${s.tiles.map(t => t.tile_id).join(",")}

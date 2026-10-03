@@ -25,6 +25,7 @@ python3 server.py 8080          # 打开 http://localhost:8080
 | 有效版本 | `north=N/south=M+P-xxxx[p优先级]…`，其描述符再做一次 sha256（descriptor_hash） |
 | 补丁 `patch` | **纯规则叠加**（只能封闭既有车道），固化基础版本瓦片哈希；不含几何/拓扑增删 |
 | 快照 `snapshot` | 车辆取路线时固定"版本描述符 + 瓦片哈希集合 + 逐边路径"，永不被后续发布/补丁改写 |
+| 试运行批次 `rollout` | 从**校验通过**的候选创建：作用区域 + 车辆名单 + 观察窗口；名单内新行程用待晋级内容，名单外读当前内容 |
 
 **接缝校验**（候选发布闸门）：端口相互声明、全局坐标重合、限速/车道数 profile 一致、
 无孤立端口，外加区域瓦片完整性（必须重述本区全部瓦片）与全部跨区验收走廊可贯通。
@@ -39,6 +40,15 @@ python3 server.py 8080          # 打开 http://localhost:8080
 
 **离线追赶**：车辆带最后确认事件号重连，服务回放全部错过事件，给出唯一当前版本与
 在途快照预警；同步本身幂等（事件检查点持久化）。
+
+**分组试运行**：批次把名单车辆的**新行程**分流到候选的待晋级内容（版本描述带
+`~RO-xxxx` 后缀，区域代际不动），其余车辆仍读当前发布内容；每个批次按
+`试运行组/对照组` 累计请求量、不可达次数与安全过渡拒绝。任一区域同时只允许一个
+进行中批次（`ROLLOUT_REGION_CONFLICT`）；晋级即走正常原子发布（基线漂移→409，
+校验失败→422，绝不留下部分区域切换），阈值越界禁止晋级（`ROLLOUT_THRESHOLD_BREACH`）；
+晋级/撤回一次性生效，重复调用返回首次结果（`idempotent:true`），反向操作→409。
+撤回只停止新的分流：已发出的行程快照与区域代际原样保留。批次与统计随
+`mapstate.json` 原子落盘，重启后完整恢复。
 
 ## API（均为 JSON，前缀 `/api`）
 
@@ -61,6 +71,9 @@ python3 server.py 8080          # 打开 http://localhost:8080
 | POST | `/snapshots/{id}/complete` | 完成行程 |
 | GET | `/vehicles/{id}` · `/vehicles/{id}/sync?last_event_id=N` | 车辆快照链 · 离线追赶 |
 | GET | `/view?mode=published\|candidate\|snapshot&ref=` | 审查页地图数据（瓦片/接缝/走廊/路线） |
+| GET/POST | `/rollouts` | 批次清单（含分组统计/阈值判定）· 创建批次 `{candidate_id, regions, vehicles, window?, thresholds?}` |
+| GET | `/rollouts/{id}` | 批次详情（各组请求量/不可达/安全过渡拒绝） |
+| POST | `/rollouts/{id}/promote` · `/rollback` | 按阈值一次性晋级（原子发布）· 撤回；重复调用返回首次结果 |
 
 ### 监管审计 API（只读线上；只写独立的 `data/audit.json`）
 
@@ -96,6 +109,9 @@ python3 server.py 8080          # 打开 http://localhost:8080
 - **🚨 封路补丁**：勾选车道生成补丁（自动给出兼容/不兼容与绕行），激活/撤销。
 - **🚗 路线复现**：请求路线、模拟"进入车道/到达节点"、封路预警、节点处安全过渡、
   行程完成、离线追赶事件回放。
+- **🧪 分组试运行**：从校验通过的候选创建批次（作用区域/对象名单/观察窗口/阈值），
+  实时监控各组请求量、不可达次数与安全过渡拒绝；阈值越界禁止晋级，
+  一键晋级（原子发布）或撤回（不动快照与代际），重复操作返回首次结果。
 - **⚖ 时序审计**（只读）：导入带序号/来源/摘要校验的车辆运行事件；在地图上重建
   指定事件序号（或时刻）的空间状态——版本描述、瓦片摘要、行驶步骤、当前位置；
   从已确认检查点一键隔离演算"版本切换"或"撤销道路管制"；导出审计证据包。
@@ -116,6 +132,11 @@ python3 server.py 8080          # 打开 http://localhost:8080
 ./route_replay.py validate RC-0003
 ./route_replay.py publish RC-0002
 ./route_replay.py sync VH-02 0
+./route_replay.py rollout-new RC-0002 north VH-01,VH-03 30 0 0   # 候选/区域/名单/窗口分钟/阈值
+./route_replay.py rollouts                    # 各组请求量/不可达/安全过渡拒绝
+./route_replay.py rollout-show RO-0001
+./route_replay.py rollout-promote RO-0001     # 一次性晋级（原子发布；重复→首次结果）
+./route_replay.py rollout-rollback RO-0001 "指标越界"   # 撤回（不动快照与代际）
 ```
 
 ## 监管审计 CLI：audit_cli.py（只读线上）
@@ -137,6 +158,8 @@ python3 server.py 8080          # 打开 http://localhost:8080
 
 一键审计演示：`bash demo_audit.sh`（自动重置两个 store 并走完整流程）。
 自动化校验：`python3 test_audit.py`（覆盖四类拒绝、幂等、续算、两种分支、隔离保证）。
+一键试运行演示：`bash demo_rollout.sh`；自动化校验：`python3 test_rollout.py`
+（分组分流/三类统计/区域冲突/阈值闸门/晋级撤回幂等/原子性/重启恢复）。
 
 ## 推荐演示路径（种子已备好两个候选）
 
@@ -153,14 +176,16 @@ python3 server.py 8080          # 打开 http://localhost:8080
 ## 文件
 
 ```
-engine.py          领域引擎：拓扑图/Dijkstra、校验、发布、补丁、快照、原子持久化
+engine.py          领域引擎：拓扑图/Dijkstra、校验、发布、补丁、快照、试运行批次、原子持久化
 server.py          标准库 HTTP API + 静态文件
-route_replay.py    路线复现/生命周期 CLI
+route_replay.py    路线复现/生命周期/试运行 CLI
 audit.py           监管审计引擎：证据链导入/时序重建/检查点/隔离分支/导出（只读线上）
 audit_cli.py       审计 CLI（导入/查询/检查点/分支/导出）
 test_audit.py      审计需求端到端校验（可重复运行）
+test_rollout.py    分组试运行端到端校验（分流/统计/冲突/幂等/原子性/重启恢复）
 demo_audit.sh      审计功能一键演示
-static/            审查页（index.html / app.js / styles.css，含 ⚖ 时序审计 标签页）
+demo_rollout.sh    分组试运行一键演示
+static/            审查页（index.html / app.js / styles.css，含 🧪 分组试运行 与 ⚖ 时序审计 标签页）
 data/mapstate.json 线上单一事实源（原子落盘；审计从不写入）
 data/audit.json    审计 append-only 存储（imports/checkpoints/branches/exports/archives）
 ```

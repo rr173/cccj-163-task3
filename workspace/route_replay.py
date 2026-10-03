@@ -17,6 +17,11 @@ Usage:
   ./route_replay.py patch <tile_id> <lane_id> "<reason>" [priority]
   ./route_replay.py activate|revoke <patch_id>
   ./route_replay.py validate|publish <candidate_id>
+  ./route_replay.py rollouts
+  ./route_replay.py rollout-new <candidate> <regions csv> <vehicles csv> [window_minutes] [max_unreachable] [max_transition_rejected]
+  ./route_replay.py rollout-show <rollout_id>
+  ./route_replay.py rollout-promote <rollout_id>
+  ./route_replay.py rollout-rollback <rollout_id> [reason]
   ./route_replay.py events [limit]
 
 Runs directly against the local store (no HTTP needed). Add --http URL to
@@ -132,6 +137,83 @@ def cmd_events(a):
     j({"events": ENGINE.list_events(int(a[0]) if a else 60)})
 
 
+def _fmt_rollout(b: dict) -> dict:
+    """Compact, explainable per-batch view for the terminal."""
+    out = dict(b)
+    out["groups"] = {
+        "trial（名单内·待晋级内容）": b["stats"]["trial"],
+        "control（名单外·当前内容）": b["stats"]["control"],
+    }
+    return out
+
+
+def cmd_rollouts(_):
+    bs = ENGINE.list_rollouts()
+    if not bs:
+        print("（暂无试运行批次）")
+        return
+    for b in bs:
+        w = b.get("window") or {}
+        win = f"{w.get('start','')} ~ {w.get('end') or '无结束'}" + \
+              ("" if b["window_open"] else "（观察窗口已结束）")
+        print(f"{b['rollout_id']}  [{b['status']}]  候选 {b['candidate_id']}  "
+              f"区域 {','.join(b['regions'])}")
+        print(f"   名单: {','.join(b['vehicles'])}   窗口: {win}")
+        if b.get("trial_version_preview"):
+            print(f"   待晋级版本: {b['trial_version_preview']}")
+        for g, label in (("trial", "试运行组"), ("control", "对照组  ")):
+            st = b["stats"][g]
+            print(f"   {label}: 请求 {st['requests']}  不可达 {st['unreachable']}  "
+                  f"安全过渡拒绝 {st['transition_rejected']}")
+        if b["breaches"]:
+            print("   ⚠ 阈值越界: " + "；".join(b["breaches"]))
+        if b.get("decision"):
+            d = b["decision"]
+            extra = f" → {d['release_id']}" if d.get("release_id") else ""
+            print(f"   判定: {d['action']}{extra} @ {d['at']}")
+
+
+def cmd_rollout_new(a):
+    from datetime import datetime, timedelta, timezone
+    body = {"candidate_id": a[0],
+            "regions": [r.strip() for r in a[1].split(",") if r.strip()],
+            "vehicles": [v.strip() for v in a[2].split(",") if v.strip()]}
+    if len(a) > 3:
+        end = (datetime.now(timezone.utc).replace(microsecond=0)
+               + timedelta(minutes=int(a[3])))
+        body["window"] = {"end": end.isoformat()}
+    th = {}
+    if len(a) > 4:
+        th["max_unreachable"] = int(a[4])
+    if len(a) > 5:
+        th["max_transition_rejected"] = int(a[5])
+    if th:
+        body["thresholds"] = th
+    j(ENGINE.create_rollout(body))
+
+
+def cmd_rollout_show(a):
+    j(_fmt_rollout(ENGINE.get_rollout(a[0])))
+
+
+def cmd_rollout_promote(a):
+    r = ENGINE.promote_rollout(a[0])
+    j(r)
+    d = r["decision"]
+    print(f"✓ 批次 {r['rollout_id']} 已晋级为 {d.get('release_id')}："
+          + "，".join(f"{k} 第 {v} 代" for k, v in (d.get("generations") or {}).items())
+          + ("（重复操作，返回首次结果）" if r.get("idempotent") else ""),
+          file=sys.stderr)
+
+
+def cmd_rollout_rollback(a):
+    r = ENGINE.rollback_rollout(a[0], a[1] if len(a) > 1 else "")
+    j(r)
+    print(f"✓ 批次 {r['rollout_id']} 已撤回；已发出快照与区域代际保持不变"
+          + ("（重复操作，返回首次结果）" if r.get("idempotent") else ""),
+          file=sys.stderr)
+
+
 CMDS = {
     "status": (cmd_status, 0),
     "plan": (cmd_plan, 3),
@@ -146,6 +228,11 @@ CMDS = {
     "revoke": (make_patch_state_cmd("revoke"), (1, 2)),
     "validate": (make_candidate_cmd("validate"), 1),
     "publish": (make_candidate_cmd("publish"), 1),
+    "rollouts": (cmd_rollouts, 0),
+    "rollout-new": (cmd_rollout_new, (3, 6)),
+    "rollout-show": (cmd_rollout_show, 1),
+    "rollout-promote": (cmd_rollout_promote, 1),
+    "rollout-rollback": (cmd_rollout_rollback, (1, 2)),
     "events": (cmd_events, (0, 1)),
 }
 

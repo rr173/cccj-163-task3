@@ -22,6 +22,9 @@ Endpoints (all JSON under /api):
   GET  /api/vehicles/{id}
   GET  /api/vehicles/{id}/sync?last_event_id=N
   GET  /api/view?mode=published|candidate|snapshot&ref=...
+  GET  /api/rollouts          POST /api/rollouts   (vehicle-group canary batches)
+  GET  /api/rollouts/{id}
+  POST /api/rollouts/{id}/promote   /rollback      (one-shot, verdict-once)
 
 Regulatory audit (read-only over live state; appends only to data/audit.json):
   POST /api/audit/template            (read-only signed demo-chain authoring)
@@ -144,6 +147,14 @@ class Handler(BaseHTTPRequestHandler):
             if action == "complete":
                 return self._send_json(ENGINE.complete_snapshot(sid))
             return self._send_json(ENGINE.adopt_reroute(sid))
+        m = re.match(r"^/api/rollouts/([^/]+)/(promote|rollback)$", path)
+        if m:
+            rid, action = m.group(1), m.group(2)
+            if action == "promote":
+                return self._send_json(ENGINE.promote_rollout(
+                    rid, body.get("created_by", body.get("by", "ops"))))
+            return self._send_json(ENGINE.rollback_rollout(
+                rid, body.get("reason", ""), body.get("by", "ops")))
 
         # ---------------- regulatory audit (read-only over live state) --------
         if path == "/api/audit/imports":
@@ -185,6 +196,7 @@ class Handler(BaseHTTPRequestHandler):
             "/api/patches": lambda: self._send_json(ENGINE.create_patch(body)),
             "/api/routes": lambda: self._send_json(ENGINE.create_route(body), 201),
             "/api/tiles": lambda: self._send_json(ENGINE.put_tile(body), 201),
+            "/api/rollouts": lambda: self._send_json(ENGINE.create_rollout(body), 201),
         }
         if path in table:
             return table[path]()
@@ -194,6 +206,9 @@ class Handler(BaseHTTPRequestHandler):
         m = re.match(r"^/api/snapshots/([^/]+)$", path)
         if m:
             return self._send_json(ENGINE.get_snapshot(m.group(1)))
+        m = re.match(r"^/api/rollouts/([^/]+)$", path)
+        if m:
+            return self._send_json(ENGINE.get_rollout(m.group(1)))
         m = re.match(r"^/api/vehicles/([^/]+)/sync$", path)
         if m:
             last = int(q.get("last_event_id", ["0"])[0])
@@ -240,6 +255,7 @@ class Handler(BaseHTTPRequestHandler):
             "/api/releases": lambda: self._send_json({"releases": ENGINE.list_releases()}),
             "/api/corridors": lambda: self._send_json({"corridors": ENGINE.list_corridors()}),
             "/api/patches": lambda: self._send_json({"patches": ENGINE.list_patches()}),
+            "/api/rollouts": lambda: self._send_json({"rollouts": ENGINE.list_rollouts()}),
             "/api/snapshots": lambda: self._send_json(self._all_snapshots()),
             "/api/view": lambda: self._send_json(
                 ENGINE.describe_view(q.get("mode", ["published"])[0],
@@ -261,6 +277,7 @@ class Handler(BaseHTTPRequestHandler):
                     "progress": snap["progress"],
                     "parent_snapshot_id": snap.get("parent_snapshot_id"),
                     "children": snap.get("children", []),
+                    "rollouts": snap.get("rollouts", []),
                     "steps": len(snap["route"]),
                     "tiles": [{"tile_id": t, "hash": short(h, 12)}
                               for t, h in sorted(snap["tiles"].items())],

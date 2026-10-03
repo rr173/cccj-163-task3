@@ -26,6 +26,7 @@
   <button data-tab="review" class="tab active">🗺️ 地图审查</button>
   <button data-tab="patches" class="tab">🚨 封路补丁</button>
   <button data-tab="routes" class="tab">🚗 路线复现</button>
+  <button data-tab="rollouts" class="tab">🧪 分组试运行</button>
   <button data-tab="audit" class="tab">⚖ 时序审计</button>
   <span class="spacer"></span>
   <button id="refreshBtn" class="ghost">↻ 刷新</button>
@@ -127,6 +128,44 @@
       <div class="panel">
         <h2>快照清单</h2>
         <div id="snapshotList" class="cardlist"></div>
+      </div>
+    </div>
+  </section>
+  <!-- ===================== ROLLOUTS ===================== -->
+  <section id="tab-rollouts" class="tabpane">
+    <div class="audit-banner">
+      <b>🧪 区域变更的车辆分组试运行。</b>
+      从<strong>校验通过</strong>的候选创建批次：名单内车辆的新行程使用待晋级内容，
+      名单外继续读取当前发布内容。任一区域同一时间只允许一个进行中批次；
+      晋级/撤回一次性生效且重复操作返回首次结果；撤回不改写已发出的行程快照、不倒退区域代际。
+    </div>
+    <div class="grid2">
+      <div class="panel">
+        <h2>① 创建试运行批次</h2>
+        <label>候选（仅列校验通过且未发布）
+          <select id="rolloutCandidate"></select>
+        </label>
+        <label>作用区域（须为候选区域的子集，逗号分隔）
+          <input id="rolloutRegions" placeholder="如 north"/>
+        </label>
+        <label>对象名单（车辆 ID，逗号分隔）
+          <input id="rolloutVehicles" placeholder="如 VH-01,VH-03"/>
+        </label>
+        <label>观察窗口（分钟；留空表示不限）
+          <input id="rolloutWindow" type="number" min="1" placeholder="如 60"/>
+        </label>
+        <label>阈值：试运行组不可达次数上限（超过则禁止晋级）
+          <input id="rolloutMaxUnreach" type="number" min="0" placeholder="留空不设限"/>
+        </label>
+        <label>阈值：安全过渡拒绝上限
+          <input id="rolloutMaxReject" type="number" min="0" placeholder="留空不设限"/>
+        </label>
+        <button id="createRolloutBtn" class="primary">创建批次（冲突区域将被拒绝）</button>
+        <div id="rolloutCreateResult" class="report" style="margin-top:8px"></div>
+      </div>
+      <div class="panel">
+        <h2>② 批次监控 <span class="hint">各组请求量 / 不可达 / 安全过渡拒绝</span></h2>
+        <div id="rolloutList" class="cardlist" style="max-height:560px"></div>
       </div>
     </div>
   </section>

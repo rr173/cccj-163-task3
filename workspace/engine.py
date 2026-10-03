@@ -196,6 +196,9 @@ class MapEngine:
         if os.path.exists(self.path):
             with open(self.path, "r", encoding="utf-8") as f:
                 self.state = json.load(f)
+            # forward-compatible migration for stores written before rollouts
+            self.state.setdefault("rollouts", {})
+            self.state.setdefault("seq", {}).setdefault("rollout", 0)
         else:
             self.state = self._blank()
             self.seed()
@@ -213,8 +216,10 @@ class MapEngine:
             "snapshots": {},      # snapshot_id -> record (immutable)
             "vehicles": {},       # vehicle_id -> {snapshots:[ids], last_event_id}
             "corridors": [],      # cross-region acceptance routes
+            "rollouts": {},       # rollout_id -> canary batch (vehicle-group trial)
             "events": [],
-            "seq": {"candidate": 0, "release": 0, "patch": 0, "snapshot": 0, "event": 0},
+            "seq": {"candidate": 0, "release": 0, "patch": 0, "snapshot": 0,
+                    "event": 0, "rollout": 0},
         }
 
     def _persist_locked(self):
@@ -528,60 +533,69 @@ class MapEngine:
             cand = s["candidates"][cid]
             if cand["status"] == "published":
                 raise DomainError("ALREADY_PUBLISHED", f"候选 {cid} 已发布", 409)
-            # optimistic concurrency: regions must not have moved since baseline
-            for r in cand["regions"]:
-                base_gen = cand["based_on_generations"].get(r, 0)
-                cur_gen = s["region_gen"].get(r, 0)
-                if base_gen != cur_gen:
-                    raise DomainError("REGION_GENERATION_CONFLICT",
-                                      f"区域 {r} 已从第 {base_gen} 代推进到第 {cur_gen} 代，"
-                                      f"候选必须基于新基线重新校验后才能发布",
-                                      409, {"region": r, "baseline": base_gen,
-                                            "current": cur_gen})
-            # re-validate atomically against the live baseline
-            tile_map = self._working_tile_map(s, cand)
-            errors, _ = self.validate_tile_map(s, tile_map, set(cand["regions"]))
-            if errors:
-                cand["validation"] = {"status": "failed", "errors": errors,
-                                      "warnings": [], "checked_at": self.now(),
-                                      "baseline_generations": {
-                                          r: s["region_gen"].get(r, 0)
-                                          for r in cand["regions"]}}
-                cand["status"] = "rejected"
-                self._persist_draft_failure(s)
-                raise DomainError("VALIDATION_FAILED",
-                                  f"候选 {cid} 接缝/跨区路线校验未通过，发布已中止",
-                                  422, {"errors": errors})
-
-            rid = "REL-" + self._next(s, "release", "REL").split("-")[1]
-            new_gens = {}
-            for r in cand["regions"]:
-                s["region_gen"][r] = s["region_gen"].get(r, 0) + 1
-                new_gens[r] = s["region_gen"][r]
-            parent = {r: s["region_heads"].get(r) for r in cand["regions"]}
-            release = {
-                "release_id": rid,
-                "candidate_id": cid,
-                "regions": list(cand["regions"]),
-                "generations": new_gens,
-                "tiles": {tid: h for tid, h in cand["tiles"].items()
-                          if s["tiles"][h]["region"] in cand["regions"]},
-                "parent_releases": parent,
-                "note": cand.get("note", ""),
-                "created_at": self.now(),
-            }
-            s["releases"].append(release)
-            for r in cand["regions"]:
-                s["region_heads"][r] = rid
-            cand["status"] = "published"
-            cand["published_as"] = rid
-            self._event_locked_run(
-                s, "RELEASE_PUBLISHED",
-                f"发布 {rid}：" + "，".join(f"{r} 第 {g} 代" for r, g in new_gens.items()),
-                rid)
-            return copy.deepcopy(release)
+            return copy.deepcopy(self._publish_locked(s, cand))
 
         return self.commit(m)
+
+    def _publish_locked(self, s: dict, cand: dict) -> dict:
+        """Atomic publish core shared by direct publish and rollout promote.
+
+        Runs inside a commit(): any raise discards the whole draft, so a
+        failed publish never leaves a partial region switch behind.
+        """
+        cid = cand["candidate_id"]
+        # optimistic concurrency: regions must not have moved since baseline
+        for r in cand["regions"]:
+            base_gen = cand["based_on_generations"].get(r, 0)
+            cur_gen = s["region_gen"].get(r, 0)
+            if base_gen != cur_gen:
+                raise DomainError("REGION_GENERATION_CONFLICT",
+                                  f"区域 {r} 已从第 {base_gen} 代推进到第 {cur_gen} 代，"
+                                  f"候选必须基于新基线重新校验后才能发布",
+                                  409, {"region": r, "baseline": base_gen,
+                                        "current": cur_gen})
+        # re-validate atomically against the live baseline
+        tile_map = self._working_tile_map(s, cand)
+        errors, _ = self.validate_tile_map(s, tile_map, set(cand["regions"]))
+        if errors:
+            cand["validation"] = {"status": "failed", "errors": errors,
+                                  "warnings": [], "checked_at": self.now(),
+                                  "baseline_generations": {
+                                      r: s["region_gen"].get(r, 0)
+                                      for r in cand["regions"]}}
+            cand["status"] = "rejected"
+            self._persist_draft_failure(s)
+            raise DomainError("VALIDATION_FAILED",
+                              f"候选 {cid} 接缝/跨区路线校验未通过，发布已中止",
+                              422, {"errors": errors})
+
+        rid = "REL-" + self._next(s, "release", "REL").split("-")[1]
+        new_gens = {}
+        for r in cand["regions"]:
+            s["region_gen"][r] = s["region_gen"].get(r, 0) + 1
+            new_gens[r] = s["region_gen"][r]
+        parent = {r: s["region_heads"].get(r) for r in cand["regions"]}
+        release = {
+            "release_id": rid,
+            "candidate_id": cid,
+            "regions": list(cand["regions"]),
+            "generations": new_gens,
+            "tiles": {tid: h for tid, h in cand["tiles"].items()
+                      if s["tiles"][h]["region"] in cand["regions"]},
+            "parent_releases": parent,
+            "note": cand.get("note", ""),
+            "created_at": self.now(),
+        }
+        s["releases"].append(release)
+        for r in cand["regions"]:
+            s["region_heads"][r] = rid
+        cand["status"] = "published"
+        cand["published_as"] = rid
+        self._event_locked_run(
+            s, "RELEASE_PUBLISHED",
+            f"发布 {rid}：" + "，".join(f"{r} 第 {g} 代" for r, g in new_gens.items()),
+            rid)
+        return release
 
     def _persist_draft_failure(self, s):
         # validation failure itself is an auditable state change (handled by commit)
@@ -600,7 +614,16 @@ class MapEngine:
             (p for p in s["patches"].values() if p["status"] == "active"),
             key=lambda p: (-int(p.get("priority", 0)), p["created_at"], p["patch_id"]))
 
-    def resolve_effective(self, s: Optional[dict] = None) -> dict:
+    def resolve_effective(self, s: Optional[dict] = None,
+                          trial_rollouts: Optional[list] = None) -> dict:
+        """Effective version descriptor.
+
+        With ``trial_rollouts`` (active canary batches the requester belongs
+        to), the tiles of each batch's candidate regions are overlaid on the
+        published heads — the *pending promotion* content. Region generations
+        themselves never move during a trial. Without trial batches the
+        descriptor is byte-identical to the published-only resolution.
+        """
         s = s or self.state
         base = {}
         tiles: dict[str, str] = {}
@@ -612,6 +635,17 @@ class MapEngine:
                 # (an old joint release must not override another head)
                 if s["tiles"][h]["region"] == region:
                     tiles[tid] = h
+        trial_refs = []
+        for b in (trial_rollouts or []):
+            cand = s["candidates"].get(b["candidate_id"])
+            if not cand:
+                continue
+            for tid, h in cand["tiles"].items():
+                if s["tiles"][h]["region"] in b["regions"]:
+                    tiles[tid] = h
+            trial_refs.append({"rollout_id": b["rollout_id"],
+                               "candidate_id": b["candidate_id"],
+                               "regions": list(b["regions"])})
         active = self._active_patches(s)
         overlays: dict[str, dict] = {}
         for p in active:
@@ -623,7 +657,8 @@ class MapEngine:
         gen_part = "/".join(f"{r}={b['generation']}" for r, b in base.items())
         patch_part = ",".join(
             f"{p['patch_id']}[p{p.get('priority', 0)}]" for p in active)
-        version = f"{gen_part or 'empty'}" + (f"+{patch_part}" if patch_part else "")
+        trial_part = "~" + ",".join(t["rollout_id"] for t in trial_refs) if trial_refs else ""
+        version = f"{gen_part or 'empty'}" + (f"+{patch_part}" if patch_part else "") + trial_part
         descriptor = {
             "version": version,
             "descriptor_hash": "",
@@ -636,6 +671,8 @@ class MapEngine:
             "overlays": overlays,
             "resolved_at": self.now(),
         }
+        if trial_refs:
+            descriptor["rollouts"] = trial_refs
         descriptor["descriptor_hash"] = sha256({k: v for k, v in descriptor.items()
                                                 if k != "descriptor_hash"})
         return descriptor
@@ -783,6 +820,249 @@ class MapEngine:
         return sorted((copy.deepcopy(p) for p in self.state["patches"].values()),
                       key=lambda p: p["created_at"], reverse=True)
 
+    # -------------------------------------------------- canary rollouts -----
+    # A rollout batch diverts *new* route requests from listed vehicles to a
+    # validated candidate's pending content (trial group); every other vehicle
+    # keeps reading the currently published content (control group). Batches
+    # never move region generations and never rewrite issued snapshots; the
+    # only exits are a one-shot promote (atomic publish) or rollback.
+
+    @staticmethod
+    def _norm_ts(v) -> Optional[str]:
+        if not v:
+            return None
+        try:
+            dt = datetime.fromisoformat(str(v).replace("Z", "+00:00"))
+        except ValueError:
+            raise DomainError("BAD_REQUEST", f"时间格式非法: {v}（需 ISO-8601）", 400)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc).replace(microsecond=0).isoformat()
+
+    def _rollout_window_open(self, b: dict, now: Optional[str] = None) -> bool:
+        now = now or self.now()
+        w = b.get("window") or {}
+        if w.get("start") and now < w["start"]:
+            return False
+        if w.get("end") and now > w["end"]:
+            return False
+        return True
+
+    def _active_rollouts(self, s: dict) -> list[dict]:
+        """Batches currently diverting traffic (active + inside window)."""
+        now = self.now()
+        return [b for b in s["rollouts"].values()
+                if b["status"] == "active" and self._rollout_window_open(b, now)]
+
+    @staticmethod
+    def _rollout_group(b: dict, vehicle_id: str) -> str:
+        return "trial" if vehicle_id in b["vehicles"] else "control"
+
+    @staticmethod
+    def _rollout_breaches(b: dict) -> list[str]:
+        th = b.get("thresholds") or {}
+        st = b["stats"]["trial"]
+        breaches = []
+        if th.get("max_unreachable") is not None and \
+                st["unreachable"] > th["max_unreachable"]:
+            breaches.append(f"试运行组不可达 {st['unreachable']} 次 > 阈值 "
+                            f"{th['max_unreachable']}")
+        if th.get("max_transition_rejected") is not None and \
+                st["transition_rejected"] > th["max_transition_rejected"]:
+            breaches.append(f"试运行组安全过渡拒绝 {st['transition_rejected']} 次 > 阈值 "
+                            f"{th['max_transition_rejected']}")
+        return breaches
+
+    def _rollout_view(self, s: dict, b: dict) -> dict:
+        v = copy.deepcopy(b)
+        v["window_open"] = self._rollout_window_open(b)
+        v["breaches"] = self._rollout_breaches(b)
+        v["promotable"] = b["status"] == "active" and not v["breaches"]
+        v["trial_version_preview"] = (
+            self.resolve_effective(s, [b])["version"] if b["status"] == "active" else None)
+        return v
+
+    def create_rollout(self, body: dict) -> dict:
+        cid = body.get("candidate_id")
+        regions = body.get("regions")
+        vehicles = body.get("vehicles")
+        if not cid or not regions or not vehicles:
+            raise DomainError("BAD_REQUEST", "candidate_id / regions / vehicles 必填", 400)
+        if not isinstance(vehicles, list) or not all(isinstance(v, str) and v.strip()
+                                                     for v in vehicles):
+            raise DomainError("BAD_REQUEST", "vehicles 必须是非空车辆名单数组", 400)
+
+        def m(s):
+            cand = s["candidates"].get(cid)
+            if not cand:
+                raise DomainError("NOT_FOUND", f"候选 {cid} 不存在", 404)
+            if cand["status"] == "published":
+                raise DomainError("CANDIDATE_PUBLISHED",
+                                  f"候选 {cid} 已发布，无需试运行", 409)
+            if (cand.get("validation") or {}).get("status") != "passed":
+                raise DomainError("ROLLOUT_CANDIDATE_NOT_VALIDATED",
+                                  f"候选 {cid} 尚未通过接缝/跨区走廊校验，不能创建试运行批次",
+                                  422)
+            regions_l = list(dict.fromkeys(regions))
+            unknown = [r for r in regions_l if r not in cand["regions"]]
+            if unknown:
+                raise DomainError("REGION_MISMATCH",
+                                  f"区域 {unknown} 不在候选 {cid} 的作用区域 "
+                                  f"{cand['regions']} 内", 400)
+            # the pending content must still be seam-safe against the live baseline
+            tile_map = self._working_tile_map(s, cand)
+            errors, _ = self.validate_tile_map(s, tile_map, set(cand["regions"]))
+            if errors:
+                raise DomainError("VALIDATION_FAILED",
+                                  f"候选 {cid} 相对当前基线校验失败，不能进入试运行",
+                                  422, {"errors": errors})
+            # one in-progress batch per region, no overlap
+            for b in s["rollouts"].values():
+                if b["status"] != "active":
+                    continue
+                overlap = sorted(set(b["regions"]) & set(regions_l))
+                if overlap:
+                    raise DomainError(
+                        "ROLLOUT_REGION_CONFLICT",
+                        f"区域 {','.join(overlap)} 已有进行中的试运行批次 "
+                        f"{b['rollout_id']}，拒绝并发冲突",
+                        409, {"regions": overlap, "conflict_with": b["rollout_id"]})
+            window_in = body.get("window") or {}
+            start = self._norm_ts(window_in.get("start")) or self.now()
+            end = self._norm_ts(window_in.get("end"))
+            if end and end <= start:
+                raise DomainError("BAD_REQUEST", "观察窗口 end 必须晚于 start", 400)
+            th = {}
+            for k in ("max_unreachable", "max_transition_rejected"):
+                v = (body.get("thresholds") or {}).get(k)
+                if v is not None:
+                    v = int(v)
+                    if v < 0:
+                        raise DomainError("BAD_REQUEST", "阈值不能为负", 400)
+                    th[k] = v
+            rid = self._next(s, "rollout", "RO")
+            batch = {
+                "rollout_id": rid,
+                "candidate_id": cid,
+                "regions": regions_l,
+                "vehicles": list(dict.fromkeys(v.strip() for v in vehicles)),
+                "window": {"start": start, "end": end},
+                "thresholds": th,
+                "status": "active",
+                "stats": {g: {"requests": 0, "unreachable": 0, "transition_rejected": 0}
+                          for g in ("trial", "control")},
+                "base_generations": {r: s["region_gen"].get(r, 0) for r in regions_l},
+                "created_by": body.get("created_by", "ops"),
+                "created_at": self.now(),
+                "decision": None,
+            }
+            s["rollouts"][rid] = batch
+            self._event_locked_run(
+                s, "ROLLOUT_CREATED",
+                f"创建试运行批次 {rid}：候选 {cid} 作用于 {','.join(regions_l)}，"
+                f"名单 {len(batch['vehicles'])} 台车辆使用待晋级内容"
+                + (f"，观察窗口至 {end}" if end else "（无结束时间）"), rid)
+            return self._rollout_view(s, batch)
+
+        return self.commit(m)
+
+    def list_rollouts(self) -> list[dict]:
+        with self.lock:
+            return sorted((self._rollout_view(self.state, b)
+                           for b in self.state["rollouts"].values()),
+                          key=lambda b: b["created_at"], reverse=True)
+
+    def get_rollout(self, rid: str) -> dict:
+        with self.lock:
+            b = self.state["rollouts"].get(rid)
+            if not b:
+                raise DomainError("NOT_FOUND", f"试运行批次 {rid} 不存在", 404)
+            return self._rollout_view(self.state, b)
+
+    @staticmethod
+    def _rollout_decision_result(batch: dict, idempotent: bool) -> dict:
+        return {"rollout_id": batch["rollout_id"],
+                "status": batch["status"],
+                "decision": copy.deepcopy(batch["decision"]),
+                "idempotent": idempotent}
+
+    def _rollout_decided_replay(self, b: dict, action: str, rid: str) -> dict:
+        """Verdict-once: repeating the same decision returns the first result;
+        asking for the opposite exit is a conflict."""
+        d = b.get("decision") or {}
+        if d.get("action") == action:
+            return self._rollout_decision_result(b, True)
+        raise DomainError("ROLLOUT_ALREADY_DECIDED",
+                          f"批次 {rid} 已{'晋级' if d.get('action') == 'promote' else '撤回'}"
+                          f"（{d.get('at')}），不能再次反向操作；首次判定结果保持不变",
+                          409, {"decision": d})
+
+    def promote_rollout(self, rid: str, by: str = "ops") -> dict:
+        with self.lock:
+            b = self.state["rollouts"].get(rid)
+            if not b:
+                raise DomainError("NOT_FOUND", f"试运行批次 {rid} 不存在", 404)
+            if b["status"] != "active":
+                return self._rollout_decided_replay(b, "promote", rid)
+
+        def m(s):
+            batch = s["rollouts"][rid]
+            breaches = self._rollout_breaches(batch)
+            if breaches:
+                raise DomainError("ROLLOUT_THRESHOLD_BREACH",
+                                  "试运行组指标越过阈值，禁止晋级，应撤回批次："
+                                  + "；".join(breaches),
+                                  422, {"breaches": breaches,
+                                        "stats": copy.deepcopy(batch["stats"])})
+            cand = s["candidates"].get(batch["candidate_id"])
+            if not cand:
+                raise DomainError("NOT_FOUND",
+                                  f"候选 {batch['candidate_id']} 不存在", 404)
+            # atomic multi-region publish; any failure discards the whole draft
+            release = self._publish_locked(s, cand)
+            batch["status"] = "promoted"
+            batch["decision"] = {
+                "action": "promote", "at": self.now(), "by": by,
+                "release_id": release["release_id"],
+                "generations": release["generations"],
+                "stats_at_decision": copy.deepcopy(batch["stats"])}
+            self._event_locked_run(
+                s, "ROLLOUT_PROMOTED",
+                f"试运行批次 {rid} 一次性晋级：候选 {cand['candidate_id']} 发布为 "
+                f"{release['release_id']}（" +
+                "，".join(f"{r} 第 {g} 代" for r, g in release["generations"].items()) +
+                "）；全部车辆此后读取新内容", rid)
+            return self._rollout_decision_result(batch, False)
+
+        return self.commit(m)
+
+    def rollback_rollout(self, rid: str, reason: str = "", by: str = "ops") -> dict:
+        with self.lock:
+            b = self.state["rollouts"].get(rid)
+            if not b:
+                raise DomainError("NOT_FOUND", f"试运行批次 {rid} 不存在", 404)
+            if b["status"] != "active":
+                return self._rollout_decided_replay(b, "rollback", rid)
+
+        def m(s):
+            batch = s["rollouts"][rid]
+            # Rollback only stops diverting *new* requests. It must not rewrite
+            # issued trip snapshots nor move any region generation — and it
+            # does neither: snapshots are immutable records and no release is
+            # created here.
+            batch["status"] = "rolled_back"
+            batch["decision"] = {
+                "action": "rollback", "at": self.now(), "by": by,
+                "reason": reason,
+                "stats_at_decision": copy.deepcopy(batch["stats"])}
+            self._event_locked_run(
+                s, "ROLLOUT_ROLLED_BACK",
+                f"试运行批次 {rid} 已撤回（{reason or '未填原因'}）：名单车辆的新行程"
+                f"恢复读取当前发布内容；已发出的行程快照与区域代际保持不变", rid)
+            return self._rollout_decision_result(batch, False)
+
+        return self.commit(m)
+
     # -------------------------------------------------- routes/snapshots ----
     def create_route(self, body: dict) -> dict:
         vehicle_id = body.get("vehicle_id", "VH-01")
@@ -791,15 +1071,28 @@ class MapEngine:
             raise DomainError("BAD_REQUEST", "from_node / to_node 必填，格式 tile/node", 400)
 
         def m(s):
-            eff = self.resolve_effective(s)
+            active = self._active_rollouts(s)
+            trial = [b for b in active
+                     if self._rollout_group(b, vehicle_id) == "trial"]
+            # listed vehicles read the pending-promotion content; everyone
+            # else keeps reading the currently published content
+            eff = self.resolve_effective(s, trial)
             tile_objs = [s["tiles"][h] for h in eff["tiles"].values()]
             g = build_graph(tile_objs, eff["overlays"])
             steps = dijkstra(g, start, goal)
             if steps is None:
-                raise DomainError("ROUTE_IMPOSSIBLE",
-                                  f"当前有效版本 {eff['version']} 下 "
-                                  f"{start} -> {goal} 无可达路径（可能因封路）", 422,
-                                  {"version": eff["version"]})
+                for b in active:
+                    st = b["stats"][self._rollout_group(b, vehicle_id)]
+                    st["requests"] += 1
+                    st["unreachable"] += 1
+                return {"_error": {
+                    "code": "ROUTE_IMPOSSIBLE",
+                    "message": f"当前有效版本 {eff['version']} 下 "
+                               f"{start} -> {goal} 无可达路径（可能因封路）",
+                    "status": 422,
+                    "details": {"version": eff["version"]}}}
+            for b in active:
+                b["stats"][self._rollout_group(b, vehicle_id)]["requests"] += 1
             used_tiles = self._tiles_used_by_steps(s, steps, eff)
             sid = "S-" + self._next(s, "snapshot", "S").split("-")[1]
             snapshot = {
@@ -822,17 +1115,30 @@ class MapEngine:
                 "parent_snapshot_id": None,
                 "children": [],
                 "completed_at": None,
+                "rollouts": [{"rollout_id": b["rollout_id"],
+                              "group": self._rollout_group(b, vehicle_id)}
+                             for b in active],
             }
             s["snapshots"][sid] = snapshot
             s["vehicles"].setdefault(vehicle_id, {"snapshots": [], "last_event_id": 0})
             s["vehicles"][vehicle_id]["snapshots"].append(sid)
+            group_note = ""
+            if trial:
+                group_note = ("，试运行 " + ",".join(b["rollout_id"] for b in trial)
+                              + " 待晋级内容")
+            elif active:
+                group_note = "，对照组读取当前发布内容"
             self._event_locked_run(
                 s, "SNAPSHOT_PINNED",
                 f"车辆 {vehicle_id} 固定快照 {sid}（版本 {eff['version']}，"
-                f"{len(used_tiles)} 瓦片，{len(steps)} 步）", sid)
+                f"{len(used_tiles)} 瓦片，{len(steps)} 步{group_note}）", sid)
             return self._snapshot_view(s, snapshot)
 
-        return self.commit(m)
+        result = self.commit(m)
+        if "_error" in result:  # unreachable counted & persisted, then reported
+            e = result["_error"]
+            raise DomainError(e["code"], e["message"], e["status"], e.get("details"))
+        return result
 
     def _tiles_used_by_steps(self, s, steps, eff) -> dict:
         used: dict[str, str] = {}
@@ -952,9 +1258,18 @@ class MapEngine:
             if not adv["closures_ahead"]:
                 raise DomainError("NO_ADVISORY", "当前无封路预警，无需过渡", 409)
             if old["progress"]["state"] != "at_node":
-                raise DomainError("NOT_AT_NODE",
-                                  "车辆正在车道上：禁止拼接拓扑。请先完成当前车道、到达节点后再过渡",
-                                  409, {"must_finish_current_lane_first": True})
+                # safe-transition refusal is a canary health signal: attribute
+                # it to the batch groups this snapshot was pinned under
+                for ref in old.get("rollouts", []):
+                    b = s["rollouts"].get(ref["rollout_id"])
+                    if b and ref["group"] in b["stats"]:
+                        b["stats"][ref["group"]]["transition_rejected"] += 1
+                return {"_error": {
+                    "code": "NOT_AT_NODE",
+                    "message": "车辆正在车道上：禁止拼接拓扑。"
+                               "请先完成当前车道、到达节点后再过渡",
+                    "status": 409,
+                    "details": {"must_finish_current_lane_first": True}}}
             i = old["progress"]["step"]
             from_node = node_key(old["route"][i]["from_tile"], old["route"][i]["from_node"])
             eff = self.resolve_effective(s)
@@ -989,7 +1304,11 @@ class MapEngine:
                 f"（新版本 {eff['version']}，全程未拼接拓扑）", new_id)
             return self._snapshot_view(s, child)
 
-        return self.commit(m)
+        result = self.commit(m)
+        if "_error" in result:  # refusal counted & persisted, then reported
+            e = result["_error"]
+            raise DomainError(e["code"], e["message"], e["status"], e.get("details"))
+        return result
 
     def complete_snapshot(self, sid: str) -> dict:
         def m(s):
@@ -1024,6 +1343,7 @@ class MapEngine:
                 "progress": snap["progress"],
                 "parent_snapshot_id": snap.get("parent_snapshot_id"),
                 "children": snap.get("children", []),
+                "rollouts": snap.get("rollouts", []),
                 "tiles": len(snap["tiles"]), "steps": len(snap["route"])}
 
     def vehicle_sync(self, vid: str, last_event_id: int) -> dict:
