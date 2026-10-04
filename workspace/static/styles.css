@@ -261,3 +261,15 @@ textarea {
   cursor: pointer; }
 .cp-chip:hover { background: #122820; }
 .branch-card .dif { color: var(--muted); font-size: 11.5px; margin-top: 4px; }
+
+/* ------------------------------------------------- canary trials -------- */
+.trial-card .tgroups { display: flex; gap: 10px; margin: 10px 0 4px; flex-wrap: wrap; }
+.tgroup { flex: 1 1 260px; border-radius: 10px; padding: 8px 10px; border: 1px solid var(--line); }
+.tg-canary { background: rgba(214,168,67,.10); border-color: rgba(214,168,67,.45); }
+.tg-control { background: rgba(120,170,120,.08); border-color: rgba(120,170,120,.35); }
+.tgroup-h { font-size: 12px; font-weight: 700; margin-bottom: 6px; }
+table.tstats { width: 100%; font-size: 12px; border-collapse: collapse; }
+table.tstats th { font-weight: 500; color: var(--muted); padding: 2px 4px; text-align: left; }
+table.tstats td { padding: 2px 4px; font-variant-numeric: tabular-nums; }
+.num-bad { color: #e88a8a; font-weight: 700; }
+#trialRegions { min-width: 220px; }

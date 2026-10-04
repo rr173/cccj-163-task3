@@ -6,7 +6,7 @@ const $$ = (s, r = document) => [...r.querySelectorAll(s)];
 
 const state = {
   status: null, candidates: [], releases: [], events: [],
-  patches: [], snapshots: [], view: null,
+  patches: [], snapshots: [], view: null, trials: [],
   viewMode: "published", viewRef: null,
   selectedCandidate: null, selectedSnapshot: null,
   fullSnapshot: null,
@@ -50,7 +50,7 @@ const esc = s => String(s ?? "").replace(/[&<>"]/g, c =>
 async function refreshAll() {
   await Promise.all([
     loadStatus(), loadCandidates(), loadReleases(),
-    loadEvents(), loadPatches(), loadSnapshots(),
+    loadEvents(), loadPatches(), loadSnapshots(), loadTrials(),
   ]);
   await refreshView();
 }
@@ -365,7 +365,8 @@ function renderSnapshots() {
   el.innerHTML = state.snapshots.map(s => {
     const sel = state.selectedSnapshot === s.snapshot_id ? "selected" : "";
     return `<div class="card ${sel}" data-sid="${esc(s.snapshot_id)}">
-      <div class="row1"><span class="id">${esc(s.snapshot_id)}</span>${badge(s.status)}</div>
+      <div class="row1"><span class="id">${esc(s.snapshot_id)}</span>${badge(s.status)}
+        ${s.canary ? '<span class="badge b-active">🧪 canary</span>' : ""}</div>
       <div class="note">${esc(s.vehicle_id)} · ${esc(s.from_node)} → ${esc(s.to_node)}</div>
       <div class="meta">${esc(s.version)}</div>
       <div class="meta">${s.steps} 步 · ${s.tiles.map(t => t.tile_id).join(",")}
@@ -461,6 +462,127 @@ function renderAdvisory() {
     无封路预警。即使区域发布了新一代地图，本快照也不会被改写。</div>`);
   el.innerHTML = items.join("");
 }
+
+// ============================================================== trials ====
+function pct(x) { return (x * 100).toFixed(1) + "%"; }
+function trialPhaseLabel(phase) {
+  return { observing: "观察中", scheduled: "未到窗口",
+           window_closed: "窗口结束·待定", finished: "已结束" }[phase] || phase;
+}
+async function loadTrials() {
+  ({ trials: state.trials } = await api("/trials"));
+  // candidate dropdown: validated-and-not-published candidates first
+  const sel = $("#trialCandidate");
+  if (sel) {
+    const cur = sel.value;
+    sel.innerHTML = state.candidates.map(c =>
+      `<option value="${esc(c.candidate_id)}" ${c.status === "published" ? "disabled" : ""}>
+        ${esc(c.candidate_id)} · ${esc(c.status)} · 区域 ${c.regions.map(esc).join(",")}
+        ${c.note ? "（" + esc(c.note.slice(0, 24)) + "）" : ""}</option>`).join("");
+    if (cur) sel.value = cur;
+    sel.onchange = populateTrialRegions;
+    populateTrialRegions();
+  }
+  renderTrials();
+}
+function populateTrialRegions() {
+  const cid = $("#trialCandidate").value;
+  const c = state.candidates.find(x => x.candidate_id === cid);
+  const rsel = $("#trialRegions");
+  rsel.innerHTML = (c ? c.regions : []).map(r =>
+    `<option value="${esc(r)}" selected>${esc(r)}</option>`).join("");
+}
+function groupStatsHtml(st, label, cls) {
+  return `<div class="tgroup ${cls}">
+    <div class="tgroup-h">${label}</div>
+    <table class="data tstats">
+      <tr><th>请求量</th><th>不可达</th><th>安全过渡拒绝</th></tr>
+      <tr><td>${st.requests}</td>
+        <td class="${st.unreachable ? "num-bad" : ""}">${st.unreachable}
+          <span class="hint">${pct(st.unreachable_rate)}</span></td>
+        <td class="${st.transition_rejected ? "num-bad" : ""}">${st.transition_rejected}
+          <span class="hint">${pct(st.transition_reject_rate)}</span></td></tr>
+    </table></div>`;
+}
+function renderTrials() {
+  const el = $("#trialList");
+  if (!el) return;
+  el.innerHTML = state.trials.map(t => {
+    const gate = t.gate;
+    const gateHtml = gate.breaches.length
+      ? gate.breaches.map(b => `<div class="err-item" style="margin-top:4px">
+          <span class="err-code">[${esc(b.metric)}]</span> ${esc(b.message)}</div>`).join("")
+      : `<div class="ok-item" style="margin-top:4px">✓ 达到晋级阈值，可一次性晋级</div>`;
+    const result = t.result ? `<div class="note-item" style="margin-top:6px">
+        首次结果（重复操作原样返回，<b>idempotent:true</b>）：<b>${esc(t.result.outcome)}</b>
+        ${t.result.release_id ? " → " + esc(t.result.release_id) : ""}
+        ${t.result.reason ? " · " + esc(t.result.reason) : ""}</div>` : "";
+    return `<div class="card trial-card">
+      <div class="row1"><span class="id">${esc(t.trial_id)}</span>
+        ${badge(t.status)}
+        <span class="badge ${t.phase === "observing" ? "b-active" : "b-proposed"}">
+          ${esc(trialPhaseLabel(t.phase))}</span>
+        ${t.idempotent ? '<span class="badge b-submitted">幂等返回</span>' : ""}</div>
+      <div class="note">候选 ${esc(t.candidate_id)} · 区域 ${t.regions.map(esc).join(",")}
+        · 名单 ${t.vehicle_allowlist.map(esc).join(",")} 台</div>
+      <div class="meta">窗口 ${esc(t.window_start.replace("T", " ").slice(5, 16))}
+        ~ ${esc(t.window_end.replace("T", " ").slice(5, 16))}
+        ${t.note ? " · " + esc(t.note) : ""}</div>
+      <div class="tgroups">
+        ${groupStatsHtml(t.stats.canary, "🧪 名单内（待晋级内容）", "tg-canary")}
+        ${groupStatsHtml(t.stats.control, "🚗 名单外（当前内容）", "tg-control")}
+      </div>
+      ${gateHtml}
+      ${result}
+      <div class="actions">
+        ${t.status === "running" ? `
+          <button class="pub" data-act="promote"
+            title="按阈值一次性晋级为区域代际发布">阈值达标→一次性晋级</button>
+          <button class="danger" data-act="withdraw">撤回（不改写已发出的快照）</button>`
+          : ""}
+      </div></div>`;
+  }).join("") || `<div class="hint">尚无试运行批次</div>`;
+
+  $$("#trialList button").forEach(btn => btn.addEventListener("click", async () => {
+    const card = btn.closest(".card");
+    const tid = card.querySelector(".id").textContent.trim();
+    try {
+      if (btn.dataset.act === "promote") {
+        const t = await api(`/trials/${encodeURIComponent(tid)}/promote`, { method: "POST" });
+        toast(`✓ ${tid} 已晋级（${t.idempotent ? "幂等返回首次结果" : "新提交"}）：` +
+          Object.entries(t.result?.generations || {}).map(([k, v]) => `${k}→第${v}代`).join("，"),
+          "ok");
+      } else {
+        const t = await api(`/trials/${encodeURIComponent(tid)}/withdraw`,
+          { method: "POST", body: { reason: "观察期指标不达标，撤回" } });
+        toast(`✓ ${tid} 已撤回（${t.idempotent ? "幂等返回首次结果" : "新提交"}）；` +
+          "已发出的试运行快照不变、区域代际不倒退", "ok");
+      }
+      await refreshAll();
+    } catch (e) { await refreshAll(); showError(e); }
+  }));
+}
+
+$("#createTrialBtn")?.addEventListener("click", async () => {
+  const cid = $("#trialCandidate").value;
+  const regions = $$("#trialRegions option:checked").map(o => o.value);
+  const vehicles = $("#trialVehicles").value.split(",").map(s => s.trim()).filter(Boolean);
+  if (!regions.length) return toast("请至少选择一个作用区域", "error");
+  if (!vehicles.length) return toast("车辆名单不能为空", "error");
+  try {
+    const t = await api("/trials", { method: "POST", body: {
+      candidate_id: cid, regions, vehicles,
+      window_minutes: Number($("#trialWindow").value || 60),
+      max_unreachable_rate: Number($("#trialMaxUnreach").value),
+      max_transition_reject_rate: Number($("#trialMaxReject").value),
+      min_requests: Number($("#trialMinReq").value || 0),
+      note: $("#trialNote").value,
+    }});
+    toast(`✓ 已创建试运行批次 ${t.trial_id}：区域 ${t.regions.join(",")}，` +
+      `名单车辆 ${t.vehicle_allowlist.length} 台`, "ok");
+    await refreshAll();
+  } catch (e) { showError(e); }
+});
 
 // =============================================================== audit =====
 async function loadAuditImports() {
@@ -779,6 +901,9 @@ function switchTab(name) {
   if (name === "audit") {
     refreshAudit().catch(showError);
   }
+  if (name === "trials") {
+    loadTrials().catch(showError);
+  }
 }
 $$(".tab").forEach(t => t.addEventListener("click", () => switchTab(t.dataset.tab)));
 
@@ -815,7 +940,8 @@ $("#planBtn").addEventListener("click", async () => {
       vehicle_id: $("#vehicleSelect").value,
       from_node: $("#fromNode").value, to_node: $("#toNode").value,
     }});
-    toast(`✓ 已固定快照 ${snap.snapshot_id}（${snap.version.version}）`, "ok");
+    toast(`✓ 已固定快照 ${snap.snapshot_id}（${snap.version.version}）` +
+      (snap.canary ? "  · 🧪 名单内车辆：使用待晋级内容" : "  · 当前已发布内容"), "ok");
     state.selectedSnapshot = snap.snapshot_id;
     state.viewMode = "snapshot"; state.viewRef = snap.snapshot_id;
     await refreshAll();

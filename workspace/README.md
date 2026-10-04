@@ -40,6 +40,27 @@ python3 server.py 8080          # 打开 http://localhost:8080
 **离线追赶**：车辆带最后确认事件号重连，服务回放全部错过事件，给出唯一当前版本与
 在途快照预警；同步本身幂等（事件检查点持久化）。
 
+**区域变更车辆分组试运行（canary）**：运维只能从**校验通过**且基线为当前代际的候选创建
+批次，指定作用区域、车辆对象名单与观察窗口（`window_start/window_end` 或
+`window_minutes`）。窗口内名单车辆的新行程解析到**待晋级内容**（候选瓦片覆盖区域 head，
+快照版本带 `区域@canary:候选(TB-xxxx)` 标记），名单外车辆继续读取当前已发布内容；活动
+补丁叠加对两组一致生效。观察窗口结束（或未开始）的批次保持 `running` 但不再分流、不再
+计数。每个批次分别统计两组的**请求量、不可达次数、安全过渡拒绝次数**（不可达拒绝也先
+落盘统计）。
+
+- **冲突互斥**：任一区域已有进行中（未决）批次时，同区域新批次与常规发布一律
+  `TRIAL_REGION_BUSY` 拒绝（含窗口已结束但尚未晋级/撤回的批次）。
+- **阈值晋级**：`promote` 先核对晋级组不可达率/过渡拒绝率/最少样本（默认
+  0.1 / 0.2 / 0），未达标 `TRIAL_GATE_BREACHED`（可 `force` 覆盖）；再用"已发布
+  head+候选覆盖"工作集原子复核接缝/走廊，通过后才按批次区域推进代际生成新 release，
+  失败不动任何区域。
+- **撤回**：`withdraw` 不改变任何区域代际；**已发出的试运行快照永不改写**（其描述符、
+  瓦片集合、路线固定；历史可逐字节复现），只有新行程回到当前内容。
+- **判定唯一**：重复晋级/撤回永远返回首次结果（`idempotent:true`）；已晋级再撤回、
+  已撤回再晋级均 409 并附带 `first_result`。
+- **持久化**：批次、两组统计、终态与首次结果全部随 mapstate 原子落盘，服务重启恢复；
+  所有写操作沿用深拷贝→临时文件→`os.replace`，失败不留部分区域切换。
+
 ## API（均为 JSON，前缀 `/api`）
 
 ### 线上运维 API
@@ -54,7 +75,10 @@ python3 server.py 8080          # 打开 http://localhost:8080
 | GET | `/releases` · `/corridors` · `/events` | 发布史/验收走廊/审计日志 |
 | GET/POST | `/patches` | 补丁队列 · 创建（自动兼容性+绕行校验） |
 | POST | `/patches/{id}/activate` · `/revoke` | 生效（复核基础哈希）· 撤销 |
-| POST | `/routes` | `{vehicle_id, from_node, to_node}` → 固定快照（201） |
+| GET/POST | `/trials` | 试运行批次清单 · 从校验通过候选创建 `{candidate_id,regions,vehicles,window_minutes|window_start/window_end,max_*}` |
+| GET | `/trials/{id}` | 批次详情：两组请求量/不可达/安全过渡拒绝与晋级闸门评估 |
+| POST | `/trials/{id}/promote` · `/withdraw` | 阈值闸门一次性晋级（`{force:true}` 可覆盖）· 撤回；重复操作返回首次结果 |
+| POST | `/routes` | `{vehicle_id, from_node, to_node}` → 固定快照（名单内车辆在窗口内得到 canary 版本，201） |
 | GET | `/snapshots` · `/snapshots/{id}` | 快照清单 · 完整复现载荷（含 tile 内容/预警） |
 | POST | `/snapshots/{id}/progress` | 上报 `{step, state: at_node|on_lane}` |
 | POST | `/snapshots/{id}/adopt-reroute` | **仅 at_node** 可过渡到绕行子快照 |
@@ -94,8 +118,11 @@ python3 server.py 8080          # 打开 http://localhost:8080
 - **🗺️ 地图审查**：区域代际表、候选卡片（一键校验/发布）、SVG 拓扑图（接缝绿/红点、
   跨区走廊绿线）、结构化校验报告、发布时间线。
 - **🚨 封路补丁**：勾选车道生成补丁（自动给出兼容/不兼容与绕行），激活/撤销。
+- **🧪 分组试运行**：从校验通过候选创建批次（区域/车辆名单/观察窗口/晋级阈值），
+  卡片展示两组请求量、不可达率、安全过渡拒绝率与阈值闸门，一键晋级或撤回；
+  终态批次重复操作显示"幂等返回首次结果"。
 - **🚗 路线复现**：请求路线、模拟"进入车道/到达节点"、封路预警、节点处安全过渡、
-  行程完成、离线追赶事件回放。
+  行程完成、离线追赶事件回放（canary 快照带 🧪 标记与批次号）。
 - **⚖ 时序审计**（只读）：导入带序号/来源/摘要校验的车辆运行事件；在地图上重建
   指定事件序号（或时刻）的空间状态——版本描述、瓦片摘要、行驶步骤、当前位置；
   从已确认检查点一键隔离演算"版本切换"或"撤销道路管制"；导出审计证据包。
@@ -115,8 +142,16 @@ python3 server.py 8080          # 打开 http://localhost:8080
 ./route_replay.py revoke P-0001 "管制解除"
 ./route_replay.py validate RC-0003
 ./route_replay.py publish RC-0002
+./route_replay.py trials                                        # 批次与两组统计
+./route_replay.py trial-start RC-0002 north VH-CANARY-01 60     # 区域/名单/窗口分钟
+./route_replay.py trial-show TB-0001
+./route_replay.py trial-promote TB-0001 [--force]               # 阈值达标晋级
+./route_replay.py trial-withdraw TB-0001 "观察期不达标"
 ./route_replay.py sync VH-02 0
 ```
+
+一键试运行演示：`bash demo_trials.sh`（自动重置 store，覆盖冲突、分流、统计、
+阈值拒绝、强制晋级、幂等返回与快照固定）。
 
 ## 监管审计 CLI：audit_cli.py（只读线上）
 
@@ -159,8 +194,10 @@ route_replay.py    路线复现/生命周期 CLI
 audit.py           监管审计引擎：证据链导入/时序重建/检查点/隔离分支/导出（只读线上）
 audit_cli.py       审计 CLI（导入/查询/检查点/分支/导出）
 test_audit.py      审计需求端到端校验（可重复运行）
+test_trials.py     车辆分组试运行需求端到端校验（冲突/分流/统计/阈值/幂等/窗口/重启）
 demo_audit.sh      审计功能一键演示
-static/            审查页（index.html / app.js / styles.css，含 ⚖ 时序审计 标签页）
+demo_trials.sh     分组试运行一键演示
+static/            审查页（index.html / app.js / styles.css，含 🧪 分组试运行 标签页）
 data/mapstate.json 线上单一事实源（原子落盘；审计从不写入）
 data/audit.json    审计 append-only 存储（imports/checkpoints/branches/exports/archives）
 ```

@@ -26,6 +26,7 @@
   <button data-tab="review" class="tab active">🗺️ 地图审查</button>
   <button data-tab="patches" class="tab">🚨 封路补丁</button>
   <button data-tab="routes" class="tab">🚗 路线复现</button>
+  <button data-tab="trials" class="tab">🧪 分组试运行</button>
   <button data-tab="audit" class="tab">⚖ 时序审计</button>
   <span class="spacer"></span>
   <button id="refreshBtn" class="ghost">↻ 刷新</button>
@@ -130,6 +131,55 @@
       </div>
     </div>
   </section>
+  <!-- ===================== TRIALS ===================== -->
+  <section id="tab-trials" class="tabpane">
+    <div class="grid2">
+      <div class="panel">
+        <h2>从校验通过的候选创建试运行批次</h2>
+        <p class="hint">运维选择<strong>作用区域</strong>、<strong>车辆对象名单</strong>与
+          <strong>观察窗口</strong>：窗口内名单车辆的新行程读取<strong>待晋级内容</strong>，
+          名单外车辆继续读取当前已发布内容；两边按组统计
+          请求量 / 不可达次数 / 安全过渡拒绝。窗口外不再分流。</p>
+        <label>候选（必须接缝/走廊校验通过，且基线为当前代际）
+          <select id="trialCandidate"></select></label>
+        <label>作用区域
+          <select id="trialRegions" multiple size="3"></select></label>
+        <label>车辆对象名单（逗号分隔）
+          <input id="trialVehicles" value="VH-CANARY-01,VH-CANARY-02"
+            placeholder="VH-CANARY-01,VH-CANARY-02"/></label>
+        <div class="routeform">
+          <label>观察窗口(分钟)
+            <input id="trialWindow" type="number" min="1" value="60" style="width:110px"/></label>
+        </div>
+        <details>
+          <summary class="hint">晋级阈值（可选）</summary>
+          <div class="routeform" style="margin-top:8px">
+            <label>不可达率≤ <input id="trialMaxUnreach" type="number" step="0.01"
+              min="0" max="1" value="0.1" style="width:90px"/></label>
+            <label>过渡拒绝率≤ <input id="trialMaxReject" type="number" step="0.01"
+              min="0" max="1" value="0.2" style="width:90px"/></label>
+            <label>最少请求 <input id="trialMinReq" type="number" min="0" value="0"
+              style="width:90px"/></label>
+          </div>
+        </details>
+        <label>备注 <input id="trialNote" placeholder="如：北区内部新增联络车道灰度"/></label>
+        <button id="createTrialBtn" class="primary">创建试运行批次</button>
+      </div>
+      <div class="panel">
+        <h2>试运行批次 <span class="hint">任一区域只允许一个进行中批次</span></h2>
+        <div id="trialList" class="cardlist"></div>
+      </div>
+    </div>
+    <div class="panel">
+      <h2>怎么验证分流</h2>
+      <p class="hint">批次运行期间，到「🚗 路线复现」页：用名单内车辆（如
+        VH-CANARY-01）请求行程 → 快照版本带 <code>@canary:RC-xxxx(TB-xxxx)</code> 标记；
+        用名单外车辆（如 VH-01）请求 → 仍是当前已发布版本。
+        名单车辆在车道上尝试「采用绕行」会记录为<strong>安全过渡拒绝</strong>；
+        不可达请求也计入对应组。回到本页刷新即可看到两组统计并一键晋级/撤回。</p>
+    </div>
+  </section>
+
   <!-- ===================== AUDIT ===================== -->
   <section id="tab-audit" class="tabpane">
     <div class="audit-banner">

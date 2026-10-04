@@ -13,6 +13,9 @@ Endpoints (all JSON under /api):
   GET  /api/corridors
   GET  /api/patches           POST /api/patches
   POST /api/patches/{id}/activate     /revoke
+  GET  /api/trials             POST /api/trials
+  GET  /api/trials/{id}
+  POST /api/trials/{id}/promote       /withdraw
   POST /api/routes            (create pinned snapshot)
   GET  /api/snapshots
   GET  /api/snapshots/{id}
@@ -136,6 +139,12 @@ class Handler(BaseHTTPRequestHandler):
             if action == "activate":
                 return self._send_json(ENGINE.activate_patch(pid))
             return self._send_json(ENGINE.revoke_patch(pid, body.get("reason", "")))
+        m = re.match(r"^/api/trials/([^/]+)/(promote|withdraw)$", path)
+        if m:
+            tid, action = m.group(1), m.group(2)
+            if action == "promote":
+                return self._send_json(ENGINE.promote_trial(tid, body))
+            return self._send_json(ENGINE.withdraw_trial(tid, body))
         m = re.match(r"^/api/snapshots/([^/]+)/(progress|adopt-reroute|complete)$", path)
         if m:
             sid, action = m.group(1), m.group(2)
@@ -183,6 +192,7 @@ class Handler(BaseHTTPRequestHandler):
         table = {
             "/api/candidates": lambda: self._send_json(ENGINE.list_candidates()),
             "/api/patches": lambda: self._send_json(ENGINE.create_patch(body)),
+            "/api/trials": lambda: self._send_json(ENGINE.create_trial(body), 201),
             "/api/routes": lambda: self._send_json(ENGINE.create_route(body), 201),
             "/api/tiles": lambda: self._send_json(ENGINE.put_tile(body), 201),
         }
@@ -201,6 +211,9 @@ class Handler(BaseHTTPRequestHandler):
         m = re.match(r"^/api/vehicles/([^/]+)$", path)
         if m:
             return self._send_json(ENGINE.vehicle_snapshots(m.group(1)))
+        m = re.match(r"^/api/trials/([^/]+)$", path)
+        if m:
+            return self._send_json(ENGINE.get_trial(m.group(1)))
 
         # -------- regulatory audit (all of these only append audit archives) ---
         if path == "/api/audit/imports":
@@ -240,6 +253,7 @@ class Handler(BaseHTTPRequestHandler):
             "/api/releases": lambda: self._send_json({"releases": ENGINE.list_releases()}),
             "/api/corridors": lambda: self._send_json({"corridors": ENGINE.list_corridors()}),
             "/api/patches": lambda: self._send_json({"patches": ENGINE.list_patches()}),
+            "/api/trials": lambda: self._send_json({"trials": ENGINE.list_trials()}),
             "/api/snapshots": lambda: self._send_json(self._all_snapshots()),
             "/api/view": lambda: self._send_json(
                 ENGINE.describe_view(q.get("mode", ["published"])[0],
@@ -257,6 +271,8 @@ class Handler(BaseHTTPRequestHandler):
                 out.append({
                     "snapshot_id": sid, "vehicle_id": vid,
                     "status": snap["status"], "version": snap["version"]["version"],
+                    "canary": snap.get("canary", False),
+                    "canary_trials": snap.get("canary_trials", []),
                     "from_node": snap["from_node"], "to_node": snap["to_node"],
                     "progress": snap["progress"],
                     "parent_snapshot_id": snap.get("parent_snapshot_id"),

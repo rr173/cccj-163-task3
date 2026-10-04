@@ -17,6 +17,11 @@ Usage:
   ./route_replay.py patch <tile_id> <lane_id> "<reason>" [priority]
   ./route_replay.py activate|revoke <patch_id>
   ./route_replay.py validate|publish <candidate_id>
+  ./route_replay.py trials
+  ./route_replay.py trial-start <candidate_id> <region[,region...]> <VH-01,VH-02,...> [window_minutes]
+  ./route_replay.py trial-show <trial_id>
+  ./route_replay.py trial-promote <trial_id> [--force]
+  ./route_replay.py trial-withdraw <trial_id> ["<reason>"]
   ./route_replay.py events [limit]
 
 Runs directly against the local store (no HTTP needed). Add --http URL to
@@ -58,6 +63,9 @@ def cmd_replay(a):
         print("活动补丁:  " + ", ".join(p["patch_id"] for p in snap["version"]["patches"]))
     print(f"状态:      {snap['status']}  进度: step={snap['progress']['step']} "
           f"{snap['progress']['state']}")
+    if snap.get("canary"):
+        print("分组试运行: 是（读取待晋级内容）· 批次 "
+              + ", ".join(snap.get("canary_trials", [])))
     print("路线（逐边）:")
     for i, st in enumerate(snap["route"]):
         if st["kind"] == "seam":
@@ -132,6 +140,52 @@ def cmd_events(a):
     j({"events": ENGINE.list_events(int(a[0]) if a else 60)})
 
 
+def cmd_trials(_):
+    rows = ENGINE.list_trials()
+    print(f"== 区域变更车辆分组试运行（{len(rows)} 个批次） ==")
+    for t in rows:
+        print(f"\n● {t['trial_id']}  [{t['status']}/{t['phase']}]"
+              f" 候选 {t['candidate_id']}  区域 {','.join(t['regions'])}")
+        print(f"  窗口: {t['window_start']} ~ {t['window_end']}"
+              + (f"  备注: {t['note']}" if t.get("note") else ""))
+        for grp, label in (("canary", "名单内(待晋级)"), ("control", "名单外(当前)")):
+            st = t["stats"][grp]
+            print(f"  {label:>14}: 请求 {st['requests']:>3}  不可达 {st['unreachable']:>3}"
+                  f"（{st['unreachable_rate']:.0%}）  安全过渡拒绝 "
+                  f"{st['transition_rejected']:>3}（{st['transition_reject_rate']:.0%}）")
+        gate = t["gate"]
+        print(f"  晋级闸门: {'✓ 可达标晋级' if gate['can_promote'] else '✗ 阈值未达标'}")
+        for b in gate["breaches"]:
+            print(f"    · [{b['metric']}] {b['message']}")
+        if t["result"]:
+            print(f"  首次结果: {t['result']['outcome']}"
+                  + (f" -> {t['result'].get('release_id', '')}"
+                     if t["result"]["outcome"] == "promoted" else "")
+                  + ("  （幂等：重复操作返回此结果）" if t.get("idempotent") is not None
+                     and t["status"] != "running" else ""))
+    if not rows:
+        print("（无试运行批次）")
+
+
+def cmd_trial_start(a):
+    body = {"candidate_id": a[0], "regions": a[1].split(","),
+            "vehicles": a[2].split(","),
+            "window_minutes": float(a[3]) if len(a) > 3 else 60}
+    j(ENGINE.create_trial(body))
+
+
+def cmd_trial_show(a):
+    j(ENGINE.get_trial(a[0]))
+
+
+def cmd_trial_promote(a):
+    j(ENGINE.promote_trial(a[0], {"force": True} if len(a) > 1 and a[1] == "--force" else {}))
+
+
+def cmd_trial_withdraw(a):
+    j(ENGINE.withdraw_trial(a[0], {"reason": a[1] if len(a) > 1 else ""}))
+
+
 CMDS = {
     "status": (cmd_status, 0),
     "plan": (cmd_plan, 3),
@@ -146,6 +200,11 @@ CMDS = {
     "revoke": (make_patch_state_cmd("revoke"), (1, 2)),
     "validate": (make_candidate_cmd("validate"), 1),
     "publish": (make_candidate_cmd("publish"), 1),
+    "trials": (cmd_trials, 0),
+    "trial-start": (cmd_trial_start, (3, 4)),
+    "trial-show": (cmd_trial_show, 1),
+    "trial-promote": (cmd_trial_promote, (1, 2)),
+    "trial-withdraw": (cmd_trial_withdraw, (1, 2)),
     "events": (cmd_events, (0, 1)),
 }
 
